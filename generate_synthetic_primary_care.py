@@ -27,6 +27,8 @@ MEDICATIONS = [
     ("100500", "dmd100500", "Amlodipine 5mg tablets"),
     ("100600", "dmd100600", "Salbutamol inhaler"),
 ]
+MIN_DEATH_AGE_YEARS = 18
+MAX_DEATH_LOOKBACK_YEARS = 25
 
 
 def random_date(start: dt.date, end: dt.date) -> dt.date:
@@ -42,7 +44,13 @@ def generate_patients(count: int) -> list[dict]:
         dob = today - dt.timedelta(days=age * 365 + random.randint(0, 364))
         has_dod = random.random() < 0.15 and age > 55
         if has_dod:
-            dod = random_date(max(dob + dt.timedelta(days=18 * 365), today - dt.timedelta(days=25 * 365)), today)
+            dod = random_date(
+                max(
+                    dob + dt.timedelta(days=MIN_DEATH_AGE_YEARS * 365),
+                    today - dt.timedelta(days=MAX_DEATH_LOOKBACK_YEARS * 365),
+                ),
+                today,
+            )
             dod_value = dod.isoformat()
         else:
             dod_value = ""
@@ -148,8 +156,18 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory where synthetic files are written")
     parser.add_argument("--patients", type=int, default=10000, help="Number of synthetic patients")
     parser.add_argument("--avg-events-per-patient", type=int, default=30, help="Average SRCode events per patient")
-    parser.add_argument("--medication-ratio", type=float, default=0.70, help="Probability that an event has medication")
-    parser.add_argument("--immunisation-ratio", type=float, default=0.70, help="Probability that an event has immunisation")
+    parser.add_argument(
+        "--medication-ratio",
+        type=float,
+        default=0.70,
+        help="Probability in [0, 1] that an event generates a medication record",
+    )
+    parser.add_argument(
+        "--immunisation-ratio",
+        type=float,
+        default=0.70,
+        help="Probability in [0, 1] that an event generates an immunisation record",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducible generation")
     args = parser.parse_args()
 
