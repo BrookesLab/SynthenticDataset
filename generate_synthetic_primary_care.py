@@ -27,8 +27,18 @@ MEDICATIONS = [
     ("100500", "dmd100500", "Amlodipine 5mg tablets"),
     ("100600", "dmd100600", "Salbutamol inhaler"),
 ]
+DEATH_PROBABILITY = 0.15
+DEATH_ELIGIBLE_AGE_YEARS = 55
 MIN_DEATH_AGE_YEARS = 18
 MAX_DEATH_LOOKBACK_YEARS = 25
+MAX_EVENTS_MULTIPLIER = 8
+
+
+def shift_years(date_value: dt.date, years: int) -> dt.date:
+    try:
+        return date_value.replace(year=date_value.year + years)
+    except ValueError:
+        return date_value.replace(month=2, day=28, year=date_value.year + years)
 
 
 def random_date(start: dt.date, end: dt.date) -> dt.date:
@@ -41,13 +51,15 @@ def generate_patients(count: int) -> list[dict]:
     patients = []
     for patient_id in range(1, count + 1):
         age = min(max(int(random.gauss(45, 20)), 0), 100)
-        dob = today - dt.timedelta(days=age * 365 + random.randint(0, 364))
-        has_dod = random.random() < 0.15 and age > 55
+        dob_window_start = shift_years(today, -(age + 1)) + dt.timedelta(days=1)
+        dob_window_end = shift_years(today, -age)
+        dob = random_date(dob_window_start, dob_window_end)
+        has_dod = random.random() < DEATH_PROBABILITY and age > DEATH_ELIGIBLE_AGE_YEARS
         if has_dod:
             dod = random_date(
                 max(
-                    dob + dt.timedelta(days=MIN_DEATH_AGE_YEARS * 365),
-                    today - dt.timedelta(days=MAX_DEATH_LOOKBACK_YEARS * 365),
+                    shift_years(dob, MIN_DEATH_AGE_YEARS),
+                    shift_years(today, -MAX_DEATH_LOOKBACK_YEARS),
                 ),
                 today,
             )
@@ -67,7 +79,7 @@ def generate_patients(count: int) -> list[dict]:
 
 def events_for_patient(avg_events: int) -> int:
     base = max(1, int(random.expovariate(1 / max(1, avg_events))))
-    return min(base, avg_events * 8)
+    return min(base, avg_events * MAX_EVENTS_MULTIPLIER)
 
 
 def generate_events(patients: list[dict], avg_events: int) -> list[dict]:
@@ -79,7 +91,7 @@ def generate_events(patients: list[dict], avg_events: int) -> list[dict]:
         patient_id = patient["IDPatient"]
         dob = dt.date.fromisoformat(patient["DateBirth"])
         latest = dt.date.fromisoformat(patient["DateDeath"]) if patient["DateDeath"] else today
-        earliest_event = max(start_date, dob + dt.timedelta(days=365))
+        earliest_event = max(start_date, shift_years(dob, 1))
         if earliest_event > latest:
             earliest_event = latest
         for _ in range(events_for_patient(avg_events)):

@@ -19,8 +19,8 @@ dataset patterns such as event density per patient, linked IDs, date windows,
 and realistic sparse/long-tail distributions.
 
 ```bash
-python /home/runner/work/SynthenticDataset/SynthenticDataset/generate_synthetic_primary_care.py \
-  --output-dir /home/runner/work/SynthenticDataset/SynthenticDataset/output \
+python ./generate_synthetic_primary_care.py \
+  --output-dir ./output \
   --patients 10000 \
   --avg-events-per-patient 30 \
   --medication-ratio 0.70 \
