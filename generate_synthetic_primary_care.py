@@ -165,7 +165,7 @@ def main() -> None:
     parser.add_argument(
         "--immunisation-ratio",
         type=float,
-        default=0.70,
+        default=0.20,
         help="Probability in [0, 1] that an event generates an immunisation record",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducible generation")

@@ -24,7 +24,7 @@ python /home/runner/work/SynthenticDataset/SynthenticDataset/generate_synthetic_
   --patients 10000 \
   --avg-events-per-patient 30 \
   --medication-ratio 0.70 \
-  --immunisation-ratio 0.70 \
+  --immunisation-ratio 0.20 \
   --seed 42
 ```
 
