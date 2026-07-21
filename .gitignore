@@ -1,0 +1,81 @@
+# ==========================================
+# 🚨 CLINICAL DATA SECURITY & PRIVACY
+# ==========================================
+# Ignore all raw input patient CSV files
+SRPatient.csv
+SRCode.csv
+SRPrimaryCareMedication.csv
+SRImmunisation.csv
+
+# Ignore all synthetic CSV output files and temporary processing folders
+Synthetic_Output/
+*.csv
+*.tmp
+
+# ==========================================
+# 🤖 TRAINED MODELS & LARGE BINARIES
+# ==========================================
+# Ignore trained SDV models and serialized checkpoints
+Trained_Models/
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.pth
+
+# ==========================================
+# 🐍 PYTHON & VIRTUAL ENVIRONMENTS
+# ==========================================
+# Virtual Environments
+myenv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ==========================================
+# 💻 IDE & OS SPECIFIC FILES
+# ==========================================
+# VS Code
+.vscode/
+
+# PyCharm / JetBrains
+.idea/
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux / Windows temp files
+*~
+*.swp
+*.tmp
+*.bak
