@@ -1,73 +1,113 @@
-import pandas as pd
-import numpy as np
 import os
+import numpy as np
+import pandas as pd
 
-INPUT_DIR = "."  # Direct directory containing your files
-CHUNK_SIZE = 500000
+INPUT_DIR = "."  # Source directory containing raw CSV files
+OUTPUT_DIR = "./processed"  # Target directory for transformed CSV files
+CHUNK_SIZE = 1_000_000  # High vectorized throughput batch size
 
 files = {
-    'patients': 'SRPatient.csv',
-    'codes': 'SRCode.csv',
-    'medications': 'SRPrimaryCareMedication.csv',
-    'immunisations': 'SRImmunisation.csv'
+    "patients": "SRPatient.csv",
+    "codes": "SRCode.csv",
+    "medications": "SRPrimaryCareMedication.csv",
+    "immunisations": "SRImmunisation.csv",
 }
 
-def preprocess_child_tables():
-    patient_path = os.path.join(INPUT_DIR, files['patients'])
-    print("Loading patient registry baseline index...")
-    srpatient_df = pd.read_csv(patient_path, usecols=["IDPatient", "DateBirth"])
-    srpatient_df["DateBirth"] = pd.to_datetime(srpatient_df["DateBirth"], errors='coerce')
-    srpatient_df["IDPatient"] = pd.to_numeric(srpatient_df["IDPatient"], errors='coerce').astype("Int64")
 
-    # Define child table configurations matching your actual headers
+def preprocess_child_tables():
+    # Ensure the destination output directory exists
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    patient_path = os.path.join(INPUT_DIR, files["patients"])
+    print("Loading patient registry baseline into fast lookup map...")
+
+    # Load only necessary columns and set index for O(1) map lookups
+    srpatient_df = pd.read_csv(
+        patient_path,
+        usecols=["IDPatient", "DateBirth"],
+        dtype={"IDPatient": "Int64"},
+    )
+    srpatient_df["DateBirth"] = pd.to_datetime(
+        srpatient_df["DateBirth"], errors="coerce"
+    )
+
+    # Convert to a fast series map indexed by IDPatient
+    dob_lookup = srpatient_df.set_index("IDPatient")["DateBirth"]
+    del srpatient_df  # Free memory immediately
+
+    # Child table configs
     child_configs = {
-        'codes': (files['codes'], ["DateEvent"]),
-        'medications': (files['medications'], ["DateEvent", "DateMedicationStart", "DateMedicationEnd"]),
-        'immunisations': (files['immunisations'], ["DateEvent"])
+        "codes": (files["codes"], ["DateEvent"]),
+        "medications": (
+            files["medications"],
+            ["DateEvent", "DateMedicationStart", "DateMedicationEnd"],
+        ),
+        "immunisations": (files["immunisations"], ["DateEvent"]),
     }
 
     for key, (filename, date_cols) in child_configs.items():
         file_path = os.path.join(INPUT_DIR, filename)
-        if not os.path.exists(file_path):
-            print(f"File {filename} not found, skipping...")
-            continue
-            
-        print(f"\nProcessing child table: {filename}...")
-        output_file = file_path + ".tmp"
-        chunk_iter = pd.read_csv(file_path, chunksize=CHUNK_SIZE)
-        
-        for i, chunk in enumerate(chunk_iter):
-            print(f" -> Processing chunk {i + 1}")
-            chunk["IDPatient"] = pd.to_numeric(chunk["IDPatient"], errors='coerce').astype("Int64")
-            
-            merged = chunk.merge(srpatient_df, on="IDPatient", how="left")
-            
-            for col in date_cols:
-                if col in merged.columns:
-                    merged[col] = pd.to_datetime(merged[col], errors='coerce')
-                    
-                    valid_mask = (
-                        merged[col].notna() &
-                        merged["DateBirth"].notna() &
-                        (merged[col] >= merged["DateBirth"])
-                    )
-                    
-                    age_col_name = col.replace("Date", "AgeAt")
-                    merged[age_col_name] = pd.Series(dtype="Int64")
-                    
-                    if valid_mask.any():
-                        ages_days = (merged.loc[valid_mask, col] - merged.loc[valid_mask, "DateBirth"]).dt.days
-                        merged.loc[valid_mask, age_col_name] = np.ceil(ages_days / 365.25).astype("Int64")
+        output_file = os.path.join(OUTPUT_DIR, filename)
 
-            # Drop baseline DOB and raw datetime columns
-            cols_to_drop = date_cols + ["DateBirth"]
-            merged.drop(columns=cols_to_drop, inplace=True, errors='ignore')
-            
-            write_header = (i == 0)
-            merged.to_csv(output_file, index=False, mode='w' if write_header else 'a', header=write_header)
-            
-        os.replace(output_file, file_path)
-        print(f" -> Success! Updated {filename} with age-relative timeline transformations.")
+        if not os.path.exists(file_path):
+            print(f"File {filename} not found in {INPUT_DIR}, skipping...")
+            continue
+
+        print(f"\nProcessing child table: {filename} -> {output_file}...")
+
+        chunk_iter = pd.read_csv(file_path, chunksize=CHUNK_SIZE, low_memory=False)
+
+        for i, chunk in enumerate(chunk_iter):
+            print(
+                f" -> Processing chunk {i + 1} (Rows {i * CHUNK_SIZE:,} - {(i + 1) * CHUNK_SIZE:,})..."
+            )
+
+            # Cast IDPatient efficiently
+            chunk["IDPatient"] = pd.to_numeric(
+                chunk["IDPatient"], errors="coerce"
+            ).astype("Int64")
+
+            # O(1) Map lookup instead of heavy DataFrame merge
+            dob_series = chunk["IDPatient"].map(dob_lookup)
+
+            for col in date_cols:
+                if col in chunk.columns:
+                    event_date = pd.to_datetime(chunk[col], errors="coerce")
+
+                    # Calculate age in days directly with vectorized operations
+                    valid_mask = (
+                        event_date.notna()
+                        & dob_series.notna()
+                        & (event_date >= dob_series)
+                    )
+
+                    age_col_name = col.replace("Date", "AgeAt")
+
+                    # Compute age in years using NumPy vectorization
+                    ages = np.full(len(chunk), np.nan)
+                    if valid_mask.any():
+                        days_diff = (
+                            event_date[valid_mask] - dob_series[valid_mask]
+                        ).dt.days
+                        ages[valid_mask] = np.ceil(days_diff / 365.25)
+
+                    chunk[age_col_name] = pd.Series(
+                        ages, index=chunk.index
+                    ).astype("Int64")
+
+            # Drop original datetime columns to conserve disk write IO
+            chunk.drop(columns=date_cols, inplace=True, errors="ignore")
+
+            write_header = i == 0
+            chunk.to_csv(
+                output_file,
+                index=False,
+                mode="w" if write_header else "a",
+                header=write_header,
+            )
+
+        print(f" -> Success! Output saved to: {output_file}")
+
 
 if __name__ == "__main__":
     preprocess_child_tables()

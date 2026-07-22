@@ -1,108 +1,139 @@
 import os
-import pandas as pd
+import gc
 import numpy as np
+import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.neighbors import NearestNeighbors
 
 # =====================================================================
 # CONFIGURATION
 # =====================================================================
-REAL_PATIENT_PATH = "SRPatient.csv"
+REAL_PATIENT_PATH = "./processed/SRPatient.csv"
 SYNTHETIC_PATIENT_PATH = "./Synthetic_Output/synthetic_SRPatient.csv"
 FILTERED_OUTPUT_PATH = "./Synthetic_Output/synthetic_SRPatient_secure.csv"
+SYNTHETIC_DIR = "./Synthetic_Output"
 
-# CLONE THRESHOLD:
-# 0.0 means the synthetic row must be an absolute exact 100% clone to be dropped.
-# 0.05 is a safe threshold (drops anything that is 95%+ identical to a real person).
-CLONE_THRESHOLD = 0.02 
+# Threshold for distance (DCR)
+CLONE_THRESHOLD = 0.001  # Set strictly to drop near-identical matches
+CHUNK_SIZE = 500_000
+
 
 def secure_synthetic_patients():
-    if not os.path.exists(REAL_PATIENT_PATH) or not os.path.exists(SYNTHETIC_PATIENT_PATH):
+    if not os.path.exists(REAL_PATIENT_PATH) or not os.path.exists(
+        SYNTHETIC_PATIENT_PATH
+    ):
         print("Error: Ensure both real and synthetic patient CSV files exist.")
         return
 
-    print("Step 1: Loading real and synthetic patient files...")
-    df_real = pd.read_csv(REAL_PATIENT_PATH, sep=',')
-    df_synth = pd.read_csv(SYNTHETIC_PATIENT_PATH, sep=',')
-    
-    # Keep track of original synthetic IDs so we can drop them later
-    original_synth_ids = df_synth['IDPatient'].copy()
-    
-    # Define features to calculate distance on (excluding unique relational IDs)
-    distance_features = ['Gender', 'AgeIn2026', 'AgeAtDeath']
-    
-    # Isolate calculation columns
-    real_feats = df_real[distance_features].copy()
-    synth_feats = df_synth[distance_features].copy()
+    print("Step 1: Loading patient registries...")
+    df_real = pd.read_csv(REAL_PATIENT_PATH, low_memory=False)
+    df_synth = pd.read_csv(SYNTHETIC_PATIENT_PATH, low_memory=False)
 
-    print("Step 2: Preprocessing and normalizing features...")
-    # Fill missing age values with a sentinel value (e.g., -1) so the distance engine can compute them
-    real_feats = real_feats.fillna(-1)
-    synth_feats = synth_feats.fillna(-1)
-    
-    # Convert categorical 'Gender' to numeric (One-Hot Encoding)
-    combined = pd.concat([real_feats, synth_feats], keys=['real', 'synth'])
-    combined_encoded = pd.get_dummies(combined, columns=['Gender'], drop_first=True)
-    
-    real_encoded = combined_encoded.xs('real')
-    synth_encoded = combined_encoded.xs('synth')
+    distance_features = ["Gender", "AgeIn2026", "AgeAtDeath"]
+    available_cols = [
+        c for c in distance_features if c in df_real.columns and c in df_synth.columns
+    ]
 
-    # Normalize age variables to scale of [0, 1]
+    print(f" -> Calculating distance across features: {available_cols}")
+
+    # Prepare real features
+    real_df = df_real[available_cols].copy()
+    synth_df = df_synth[available_cols].copy()
+
+    # Fill NaNs safely
+    real_df = real_df.fillna(-1)
+    synth_df = synth_df.fillna(-1)
+
+    # Encode Gender efficiently
+    if "Gender" in available_cols:
+        gender_map = {
+            val: idx for idx, val in enumerate(real_df["Gender"].unique())
+        }
+        real_df["Gender"] = real_df["Gender"].map(gender_map).fillna(-1)
+        synth_df["Gender"] = synth_df["Gender"].map(gender_map).fillna(-1)
+
+    # Scale numeric columns
     scaler = MinMaxScaler()
-    numerical_cols = ['AgeIn2026', 'AgeAtDeath']
-    
-    real_encoded[numerical_cols] = scaler.fit_transform(real_encoded[numerical_cols])
-    synth_encoded[numerical_cols] = scaler.transform(synth_encoded[numerical_cols])
+    real_scaled = scaler.fit_transform(real_df.astype(np.float32))
+    synth_scaled = scaler.transform(synth_df.astype(np.float32))
 
-    print("Step 3: Finding the nearest real-world neighbor for each synthetic patient...")
-    # Fit the nearest neighbors engine on the REAL patient registry
-    # Using L1 distance (Manhattan distance) works exceptionally well for mixed data
-    nn = NearestNeighbors(n_neighbors=1, metric='manhattan', n_jobs=-1)
-    nn.fit(real_encoded)
+    # Free memory
+    del df_real, real_df, synth_df
+    gc.collect()
 
-    # For every synthetic record, find the distance to its closest real neighbor
-    distances, indices = nn.kneighbors(synth_encoded)
-    
-    # Flatten the distance array
+    print("Step 2: Fitting Nearest Neighbors model (float32 optimized)...")
+    nn = NearestNeighbors(
+        n_neighbors=1, metric="manhattan", algorithm="kd_tree", n_jobs=-1
+    )
+    nn.fit(real_scaled)
+
+    print("Step 3: Calculating distance to closest real neighbor...")
+    distances, _ = nn.kneighbors(synth_scaled)
     distances = distances.flatten()
 
-    # Identify clone candidates
+    # Identify true clone matches
     clone_mask = distances <= CLONE_THRESHOLD
-    num_clones = np.sum(clone_mask)
+    num_clones = int(np.sum(clone_mask))
     total_synth = len(df_synth)
-    
-    print(f"\nAnalysis Completed:")
-    print(f" -> Total Synthetic Patients Checked: {total_synth:,}")
-    print(f" -> Potential Clones Identified: {num_clones:,} ({ (num_clones / total_synth) * 100:.2f}%)")
 
-    # Step 4: Filtering out the clones
+    print("\nAnalysis Completed:")
+    print(f" -> Total Synthetic Patients Checked: {total_synth:,}")
+    print(
+        f" -> Potential Clones Flagged: {num_clones:,} ({(num_clones / total_synth) * 100:.2f}%)"
+    )
+
+    # Step 4: Write filtered parent dataset
     if num_clones > 0:
-        print(f" -> Removing clone records with distance <= {CLONE_THRESHOLD}...")
+        print(f" -> Dropping {num_clones:,} clone records...")
         secure_df_synth = df_synth[~clone_mask].copy()
-        
-        # Save the secure patient dataset
-        secure_df_synth.to_csv(FILTERED_OUTPUT_PATH, index=False, sep=',')
-        print(f" -> Safe dataset written to: {FILTERED_OUTPUT_PATH}")
-        
-        # (Optional) Clean up child tables to match
-        print("\nStep 5: Cascading deletion to child tables...")
-        allowed_patient_ids = set(secure_df_synth['IDPatient'].astype(str))
-        
-        child_files = ['synthetic_SRCode.csv', 'synthetic_SRPrimaryCareMedication.csv', 'synthetic_SRImmunisation.csv']
-        for child_file in child_files:
-            child_path = os.path.join("./Synthetic_Output", child_file)
-            if os.path.exists(child_path):
-                print(f" -> Filtering {child_file}...")
-                df_child = pd.read_csv(child_path, sep=',')
-                df_child['IDPatient'] = df_child['IDPatient'].astype(str)
-                
-                # Only keep events for patients who survived the privacy filter
-                filtered_child = df_child[df_child['IDPatient'].isin(allowed_patient_ids)]
-                filtered_child.to_csv(child_path, index=False, sep=',')
-                
     else:
-        print(" -> Perfect! No synthetic clones detected. Your data is secure.")
-        df_synth.to_csv(FILTERED_OUTPUT_PATH, index=False, sep=',')
+        print(" -> No clones identified under threshold.")
+        secure_df_synth = df_synth.copy()
+
+    secure_df_synth.to_csv(FILTERED_OUTPUT_PATH, index=False)
+    print(f" -> Secure parent registry saved to: {FILTERED_OUTPUT_PATH}")
+
+    # Step 5: Streaming Cascade Removal for Child Tables
+    print("\nStep 5: Streaming cascaded filtering on child tables...")
+    allowed_ids = set(
+        pd.to_numeric(secure_df_synth["IDPatient"], errors="coerce")
+        .dropna()
+        .astype("Int64")
+    )
+
+    child_files = [
+        "synthetic_SRCode.csv",
+        "synthetic_SRPrimaryCareMedication.csv",
+        "synthetic_SRImmunisation.csv",
+    ]
+
+    for child_file in child_files:
+        child_path = os.path.join(SYNTHETIC_DIR, child_file)
+        if not os.path.exists(child_path):
+            continue
+
+        print(f" -> Filtering {child_file} in chunks...")
+        temp_child_path = child_path + ".tmp"
+
+        chunk_iter = pd.read_csv(child_path, chunksize=CHUNK_SIZE, low_memory=False)
+
+        for i, chunk in enumerate(chunk_iter):
+            chunk["IDPatient"] = pd.to_numeric(
+                chunk["IDPatient"], errors="coerce"
+            ).astype("Int64")
+            filtered_chunk = chunk[chunk["IDPatient"].isin(allowed_ids)]
+
+            write_header = i == 0
+            filtered_chunk.to_csv(
+                temp_child_path,
+                index=False,
+                mode="w" if write_header else "a",
+                header=write_header,
+            )
+
+        os.replace(temp_child_path, child_path)
+        print(f" -> Successfully updated {child_file}")
+
 
 if __name__ == "__main__":
     secure_synthetic_patients()
