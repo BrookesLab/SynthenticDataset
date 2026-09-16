@@ -15,37 +15,38 @@ pd.set_option("future.no_silent_downcasting", True)
 # =====================================================================
 # 🎛️ PIPELINE CONFIGURATION & CONTROL SWITCHES
 # =====================================================================
-TEST_MODE = False  # Set to True for a dry-run on 10 patients
+TEST_MODE = False  # Set to False for the full 500k production run
 
 BASE_PATH = "Subsamples"
-PREPROCESSED_DIR = "Preprocessed_Data"
+PREPROCESSED_DIR = "hma/Preprocessed_Data"
 CURRENT_YEAR = 2026
-DELIMITER = ","
+DELIMITER = ","  # 👈 CSV Comma Separator
 READ_ENCODING = "latin-1"
+CHUNKSIZE = 1_000_000
 
 if TEST_MODE:
     print("⚠️ [EXECUTION MODE: TEST DRY RUN - 10 PATIENTS ONLY]")
-    OUTPUT_DIR = "Synthetic_Output_test"
-    MODEL_DIR = "Trained_Models_test"
-    TEMP_CHUNK_DIR = "Temp_Chunks_test"
+    OUTPUT_DIR = "hma_test/Synthetic_Output"
+    MODEL_DIR = "hma_test/Trained_Models"
+    TEMP_CHUNK_DIR = "hma_test/Temp_Chunks"
     TARGET_PATIENTS = 10
     NUM_GEN_CHUNKS = 1
     SAMPLE_SCALE_PER_CHUNK = 1.0
 else:
-    print("🚀 [EXECUTION MODE: PRODUCTION RUN - FULL COHORT]")
-    OUTPUT_DIR = "Synthetic_Output"
-    MODEL_DIR = "Trained_Models"
-    TEMP_CHUNK_DIR = "Temp_Chunks"
-    TRAIN_SAMPLE_FRACTION = 0.10  # 10% stratified sample (~50k patients, ~16M child rows)
-    NUM_GEN_CHUNKS = 10           # 10 chunks x 1.0 scale to reconstitute 100% volume
-    SAMPLE_SCALE_PER_CHUNK = 1.0
+    print("🚀 [EXECUTION MODE: PRODUCTION RUN - FULL LLR-DfR COHORT]")
+    OUTPUT_DIR = "hma_prod/Synthetic_Output"
+    MODEL_DIR = "hma_prod/Trained_Models"
+    TEMP_CHUNK_DIR = "hma_prod/Temp_Chunks"
+    TRAIN_SAMPLE_FRACTION = 0.03  # 3% stratified sample (~15k patients)
+    NUM_GEN_CHUNKS = 8
+    SAMPLE_SCALE_PER_CHUNK = 4.1667  # 👈 Scale factor to hit 500k total
 
 os.makedirs(PREPROCESSED_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(TEMP_CHUNK_DIR, exist_ok=True)
 
-# File names matching your exact input data
+# LLR-DfR CSV File Mappings
 files = {
     "patients": "SRPatient.csv",
     "codes": "SRCode.csv",
@@ -53,45 +54,41 @@ files = {
     "immunisations": "SRImmunisation.csv",
 }
 
-# Explicit dtypes matching your exact tables
 COL_TYPES = {
     "patients": {
         "IDPatient": "str",
         "Gender": "str",
         "AgeIn2026": "float",
         "AgeAtDeath": "float",
+        "DiseaseMedRatio": "float",
     },
     "codes": {
-        "IDEvent": "str",
-        "IDPatient": "str",
         "CTV3Code": "str",
         "SNOMEDCode": "str",
         "EpisodeType": "str",
+        "IDEvent": "str",
+        "IDPatient": "str",
+        "AgeAtEvent": "float",
+    },
+    "immunisations": {
+        "Dose": "str",
+        "Location": "str",
+        "ImmsReadCode": "str",
+        "ImmsSNOMEDCode": "str",
+        "IDPatient": "str",
         "AgeAtEvent": "float",
     },
     "medications": {
-        "IDEvent": "str",
-        "IDPatient": "str",
         "IDMultiLexProduct": "str",
-        "IDMultiLexDMD": "str",
         "NameOfMedication": "str",
+        "MedicationDosage": "str",
+        "IDPatient": "str",
         "AgeAtMedicationStart": "float",
         "AgeAtMedicationEnd": "float",
     },
-    "immunisations": {
-        "IDPatient": "str",
-        "IDImmunisationContent": "str",
-        "Dose": "str",
-        "Location": "str",
-        "Method": "str",
-        "ImmsReadCode": "str",
-        "ImmsSNOMEDCode": "str",
-        "VaccPart": "str",
-        "AgeAtEvent": "float",
-    },
 }
 
-# Clinical Biology Regex Keywords
+# Clinical Biology Regex Keywords (Used ONLY for Medications text descriptions)
 FEMALE_KEYWORDS = [
     r"\bpregnancy\b", r"\bpregnant\b", r"\bcervical\b", r"\bovarian\b",
     r"\bantenatal\b", r"\bpostnatal\b", r"\bmenopause\b", r"\bcontraceptive\b",
@@ -107,163 +104,267 @@ MALE_REGEX = re.compile("|".join(MALE_KEYWORDS), re.IGNORECASE)
 
 np.random.seed(42)
 
-# =====================================================================
-# UTILITIES
-# =====================================================================
-def parse_date_to_year(series: pd.Series) -> pd.Series:
-    """Parses standard ISO dates (YYYY-MM-DD) or extract 4-digit years."""
-    parsed = pd.to_datetime(series, errors="coerce", format="mixed")
-    years = parsed.dt.year
-    unparsed = years.isna()
-    if unparsed.any():
-        extracted = series[unparsed].astype(str).str.extract(r"(\b19\d{2}\b|\b20\d{2}\b)")[0]
-        years.loc[unparsed] = pd.to_numeric(extracted, errors="coerce")
-    return years.astype("Int64")
+
+def parse_year(series: pd.Series) -> pd.Series:
+    """Extracts 4-digit years (1900-2099) from YYYY, YYYYMM, or YYYYMMDD formats."""
+    s = series.astype(str).str.strip()
+    year_str = s.str.extract(r"(19\d{2}|20\d{2})")[0]
+    return pd.to_numeric(year_str, errors="coerce").astype("Int64")
 
 
 # =====================================================================
-# STEP 1: PREPROCESSING & RELATIVE AGE CALCULATION
+# STEP 1: PREPROCESSING RAW DATA & ANONYMIZATION
 # =====================================================================
 def run_step1_preprocessing():
-    print("\n--- STEP 1: Preprocessing & Anonymizing Dates to Ages ---")
-    
-    # 1A. Process SRPatient.csv
     pat_in = os.path.join(BASE_PATH, files["patients"])
     pat_out = os.path.join(PREPROCESSED_DIR, files["patients"])
+    print(f"\n--- STEP 1: Processing Patients from {pat_in} ---")
+
+    df = pd.read_csv(
+        pat_in,
+        sep=DELIMITER,
+        encoding=READ_ENCODING,
+        low_memory=False,
+        on_bad_lines="skip",
+        dtype=str,
+    )
+    df.columns = df.columns.str.strip()
+
+    df["IDPatient"] = df["IDPatient"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+    df = df[~df["IDPatient"].isin(["", "nan", "None", "-1", "<NA>"])].drop_duplicates(subset=["IDPatient"])
+
+    df["Gender"] = df.get("Gender", "U").astype(str).str.strip().str.upper()
+    df["Gender"] = df["Gender"].replace({"FEMALE": "F", "MALE": "M"})
+    df["Gender"] = df["Gender"].apply(lambda x: x if x in ["F", "M"] else "U")
+
+    b_col = "DateBirth" if "DateBirth" in df.columns else "YearOfBirth"
+    d_col = "DateDeath" if "DateDeath" in df.columns else "YearOfDeath"
+
+    b_year = parse_year(df[b_col]) if b_col in df.columns else pd.Series(np.nan, index=df.index, dtype="Int64")
+    d_year = parse_year(df[d_col]) if d_col in df.columns else pd.Series(np.nan, index=df.index, dtype="Int64")
+
+    df["AgeIn2026"] = np.where(b_year.notna() & d_year.isna(), CURRENT_YEAR - b_year, np.nan)
+    df["AgeAtDeath"] = np.where(b_year.notna() & d_year.notna() & (d_year >= b_year), d_year - b_year, np.nan)
+
+    df["AgeIn2026"] = pd.to_numeric(df["AgeIn2026"], errors="coerce")
+    df["AgeAtDeath"] = pd.to_numeric(df["AgeAtDeath"], errors="coerce")
+
+    # Memory-safe chunked accumulation for counts to build DiseaseMedRatio
+    code_path = os.path.join(BASE_PATH, files["codes"])
+    med_path = os.path.join(BASE_PATH, files["medications"])
     
-    df_pat = pd.read_csv(pat_in, sep=DELIMITER, encoding=READ_ENCODING, low_memory=False, on_bad_lines="skip")
-    df_pat.columns = df_pat.columns.str.strip()
-    df_pat["IDPatient"] = df_pat["IDPatient"].astype(str).str.strip()
-    df_pat = df_pat.dropna(subset=["IDPatient"]).drop_duplicates(subset=["IDPatient"])
+    code_counts, med_counts = {}, {}
 
-    b_years = parse_date_to_year(df_pat["DateBirth"])
-    d_years = parse_date_to_year(df_pat["DateDeath"]) if "DateDeath" in df_pat.columns else pd.Series(pd.NA, index=df_pat.index, dtype="Int64")
+    if os.path.exists(code_path):
+        for chunk in pd.read_csv(code_path, sep=DELIMITER, usecols=["IDPatient"], chunksize=CHUNKSIZE, encoding=READ_ENCODING, low_memory=False, on_bad_lines="skip", dtype=str):
+            chunk["IDPatient"] = chunk["IDPatient"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+            for pid, cnt in chunk["IDPatient"].value_counts().items():
+                code_counts[pid] = code_counts.get(pid, 0) + cnt
 
-    df_pat["AgeIn2026"] = pd.Series(dtype="Int64", index=df_pat.index)
-    df_pat["AgeAtDeath"] = pd.Series(dtype="Int64", index=df_pat.index)
+    if os.path.exists(med_path):
+        for chunk in pd.read_csv(med_path, sep=DELIMITER, usecols=["IDPatient"], chunksize=CHUNKSIZE, encoding=READ_ENCODING, low_memory=False, on_bad_lines="skip", dtype=str):
+            chunk["IDPatient"] = chunk["IDPatient"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+            for pid, cnt in chunk["IDPatient"].value_counts().items():
+                med_counts[pid] = med_counts.get(pid, 0) + cnt
 
-    death_mask = b_years.notna() & d_years.notna() & (d_years >= b_years)
-    living_mask = b_years.notna() & d_years.isna()
+    s_codes = pd.Series(code_counts, dtype=float)
+    s_meds = pd.Series(med_counts, dtype=float)
 
-    df_pat.loc[death_mask, "AgeAtDeath"] = d_years[death_mask] - b_years[death_mask]
-    df_pat.loc[living_mask, "AgeIn2026"] = CURRENT_YEAR - b_years[living_mask]
+    log_codes = np.log1p(df["IDPatient"].map(s_codes).fillna(0))
+    log_meds = np.log1p(df["IDPatient"].map(s_meds).fillna(0))
+    df["DiseaseMedRatio"] = log_codes / (log_meds + 1e-5)
 
-    df_pat.drop(columns=["DateBirth", "DateDeath"], inplace=True, errors="ignore")
-    df_pat.to_csv(pat_out, sep=DELIMITER, index=False, encoding="utf-8")
+    dob_map = dict(zip(df["IDPatient"], b_year))
 
-    dob_map = dict(zip(df_pat["IDPatient"], b_years))
-    print(f" -> Processed {len(df_pat):,} patients. Birth lookup loaded.")
+    df = df[["IDPatient", "Gender", "AgeIn2026", "AgeAtDeath", "DiseaseMedRatio"]]
+    df.to_csv(pat_out, sep=DELIMITER, index=False, na_rep="")
+    print(f" -> Saved {len(df):,} primary patient records with DiseaseMedRatio feature.")
 
-    # 1B. Chunk-Process Child Tables
-    child_specs = {
+    del df, s_codes, s_meds
+    gc.collect()
+
+    # Process Child Tables
+    child_date_map = {
         "codes": (files["codes"], ["DateEvent"]),
-        "medications": (files["medications"], ["DateMedicationStart", "DateMedicationEnd"]),
+        "medications": (files["medications"], ["DateEvent", "DateMedicationStart", "DateMedicationEnd"]),
         "immunisations": (files["immunisations"], ["DateEvent"]),
     }
 
-    for key, (filename, date_cols) in child_specs.items():
+    for key, (filename, date_cols) in child_date_map.items():
         file_in = os.path.join(BASE_PATH, filename)
         file_out = os.path.join(PREPROCESSED_DIR, filename)
         if not os.path.exists(file_in):
             continue
-
-        print(f" -> Preprocessing child table: {filename}...")
-        chunk_iter = pd.read_csv(file_in, sep=DELIMITER, chunksize=1500000, encoding=READ_ENCODING, low_memory=False, on_bad_lines="skip")
-        
+            
+        print(f" -> Processing child table: {filename}...")
+        chunk_iter = pd.read_csv(
+            file_in, 
+            sep=DELIMITER, 
+            chunksize=CHUNKSIZE, 
+            encoding=READ_ENCODING, 
+            low_memory=False, 
+            on_bad_lines="skip"
+        )
         for i, chunk in enumerate(chunk_iter):
             chunk.columns = chunk.columns.str.strip()
-            chunk["IDPatient"] = chunk["IDPatient"].astype(str).str.strip()
-            chunk = chunk.dropna(subset=["IDPatient"])
-
+            chunk["IDPatient"] = chunk["IDPatient"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+            chunk = chunk[chunk["IDPatient"].isin(dob_map)]
+            
             p_births = chunk["IDPatient"].map(dob_map)
-
+            
             for d_col in date_cols:
                 if d_col in chunk.columns:
-                    e_years = parse_date_to_year(chunk[d_col])
+                    e_years = parse_year(chunk[d_col])
                     age_col = d_col.replace("Date", "AgeAt")
                     age_series = e_years - p_births
                     valid_mask = (age_series >= 0) & age_series.notna()
-                    
-                    # Fixed: using pandas .where() to properly support nullable "Int64"
-                    chunk[age_col] = age_series.where(valid_mask, np.nan).astype("Int64")
+                    chunk[age_col] = np.where(valid_mask, age_series, np.nan)
+                    chunk[age_col] = pd.to_numeric(chunk[age_col], errors="coerce")
+            
+            chunk.drop(columns=date_cols, inplace=True, errors="ignore")
+            
+            # Structural sanity cleans & exact LLR-DfR schema mappings
+            if key == "codes" and "SNOMEDCode" in chunk.columns:
+                chunk["SNOMEDCode"] = chunk["SNOMEDCode"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+                chunk = chunk[~chunk["SNOMEDCode"].isin(["", "nan", "None", "-1", "<NA>"])]
+            elif key == "medications" and "IDMultiLexProduct" in chunk.columns:
+                chunk["IDMultiLexProduct"] = chunk["IDMultiLexProduct"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+                chunk = chunk[~chunk["IDMultiLexProduct"].isin(["", "nan", "None", "-1", "<NA>"])]
+            elif key == "immunisations":
+                if "ImmsSNOMEDCode" in chunk.columns:
+                    chunk["ImmsSNOMEDCode"] = chunk["ImmsSNOMEDCode"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+                if "ImmsReadCode" in chunk.columns:
+                    chunk["ImmsReadCode"] = chunk["ImmsReadCode"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
 
-            chunk.drop(columns=[c for c in date_cols if c in chunk.columns] + ["DateEvent"], inplace=True, errors="ignore")
-            chunk.to_csv(file_out, sep=DELIMITER, mode="w" if i == 0 else "a", header=(i == 0), index=False, encoding="utf-8")
+            chunk.to_csv(file_out, sep=DELIMITER, mode="w" if i == 0 else "a", header=(i == 0), index=False, na_rep="")
+    print("✅ PREPROCESSING COMPLETE.")
 
 
 # =====================================================================
-# STEP 2 & 3: STRATIFIED SAMPLING & HMA FITTING (UPDATED)
+# STEP 2 & 3: FEATURE FLATTENING, MODEL TRAINING & FITTING
 # =====================================================================
 def run_step2_and_3_training():
-    print("\n--- STEP 2 & 3: Stratified Sampling & HMASynthesizer Fitting ---")
+    print("\n--- STEP 2 & 3: Feature Vector Flattening & HMA Model Fitting ---")
     
-    pat_path = os.path.join(PREPROCESSED_DIR, files["patients"])
-    df_patients_all = pd.read_csv(pat_path, sep=DELIMITER, encoding=READ_ENCODING, dtype=COL_TYPES["patients"])
+    patients_path = os.path.join(PREPROCESSED_DIR, files["patients"])
+    df_patients_all = pd.read_csv(patients_path, sep=DELIMITER, encoding=READ_ENCODING, dtype=COL_TYPES["patients"])
     df_patients_all.columns = df_patients_all.columns.str.strip()
-
+    df_patients_all = df_patients_all.dropna(subset=["IDPatient"]).drop_duplicates(subset=["IDPatient"])
+    
     real_code_vocab_freq = {}
     code_counts, med_counts, imm_counts = {}, {}, {}
-
+    
+    # Track frequencies and compute summary counts
     for table_key, storage_dict in [("codes", code_counts), ("medications", med_counts), ("immunisations", imm_counts)]:
         f_path = os.path.join(PREPROCESSED_DIR, files[table_key])
         if os.path.exists(f_path):
             vocab_counter = {}
+            chunk_iter = pd.read_csv(f_path, sep=DELIMITER, chunksize=1000000, encoding=READ_ENCODING, low_memory=False, on_bad_lines="skip")
             code_col = "SNOMEDCode" if table_key == "codes" else ("IDMultiLexProduct" if table_key == "medications" else "ImmsSNOMEDCode")
-            chunk_iter = pd.read_csv(f_path, sep=DELIMITER, chunksize=1500000, encoding=READ_ENCODING, low_memory=False, on_bad_lines="skip")
             
             for chunk in chunk_iter:
                 chunk.columns = chunk.columns.str.strip()
                 if "IDPatient" in chunk.columns:
-                    vc_pat = chunk["IDPatient"].value_counts()
-                    for pid, cnt in vc_pat.items():
-                        storage_dict[str(pid)] = storage_dict.get(str(pid), 0) + cnt
+                    counts = chunk["IDPatient"].value_counts()
+                    for pid, cnt in counts.items():
+                        pid_str = str(pid)
+                        storage_dict[pid_str] = storage_dict.get(pid_str, 0) + cnt
                 if code_col in chunk.columns:
-                    vc_code = chunk[code_col].dropna().value_counts()
-                    for c_val, cnt in vc_code.items():
-                        vocab_counter[str(c_val)] = vocab_counter.get(str(c_val), 0) + cnt
+                    vc = chunk[code_col].dropna().value_counts()
+                    for item_code, cnt in vc.items():
+                        vocab_counter[str(item_code)] = vocab_counter.get(str(item_code), 0) + cnt
             real_code_vocab_freq[table_key] = vocab_counter
 
     with open(os.path.join(MODEL_DIR, "real_vocab_frequencies.json"), "w") as f:
         json.dump(real_code_vocab_freq, f)
 
-    # Feature engineering for stratified sampling
+    # Learn data-driven sex-exclusive SNOMED codes for the codes table
+    snomed_gender_tracker = {}
+    code_path_prep = os.path.join(PREPROCESSED_DIR, files["codes"])
+    if os.path.exists(code_path_prep):
+        pat_gender_dict = dict(zip(df_patients_all["IDPatient"].str.strip(), df_patients_all["Gender"].str.strip()))
+        for chunk in pd.read_csv(code_path_prep, sep=DELIMITER, chunksize=1000000, encoding=READ_ENCODING, low_memory=False, on_bad_lines="skip", dtype=str):
+            chunk.columns = chunk.columns.str.strip()
+            if "IDPatient" in chunk.columns and "SNOMEDCode" in chunk.columns:
+                chunk["IDPatient"] = chunk["IDPatient"].astype(str).str.strip()
+                chunk["Gender"] = chunk["IDPatient"].map(pat_gender_dict)
+                for _, row in chunk.dropna(subset=["SNOMEDCode", "Gender"]).iterrows():
+                    code = str(row["SNOMEDCode"]).strip()
+                    gender = str(row["Gender"]).strip()
+                    if code not in snomed_gender_tracker:
+                        snomed_gender_tracker[code] = set()
+                    snomed_gender_tracker[code].add(gender)
+                    
+        exclusive_female_codes = {code for code, genders in snomed_gender_tracker.items() if genders == {"F"}}
+        exclusive_male_codes = {code for code, genders in snomed_gender_tracker.items() if genders == {"M"}}
+        
+        with open(os.path.join(MODEL_DIR, "sex_exclusive_codes.json"), "w") as f:
+            json.dump({
+                "female_exclusive": list(exclusive_female_codes),
+                "male_exclusive": list(exclusive_male_codes)
+            }, f)
+
+    # Inject Log-Count Features onto Parent Table
     df_patients_all["LogNumCodes"] = np.log1p(df_patients_all["IDPatient"].map(code_counts).fillna(0))
     df_patients_all["LogNumMeds"] = np.log1p(df_patients_all["IDPatient"].map(med_counts).fillna(0))
     df_patients_all["LogNumImms"] = np.log1p(df_patients_all["IDPatient"].map(imm_counts).fillna(0))
 
-    df_patients_all["UtilGroup"] = pd.qcut(df_patients_all["LogNumCodes"] + df_patients_all["LogNumMeds"], q=4, labels=["L", "M", "H", "VH"], duplicates="drop")
-    df_patients_all["AgeGroup"] = pd.qcut(df_patients_all["AgeIn2026"].fillna(50), q=5, labels=False, duplicates="drop")
+    # Safe Stratified Sampling Setup with Fallback for Tied/Small Cohorts
+    try:
+        df_patients_all["UtilGroup"] = pd.qcut(
+            df_patients_all["LogNumCodes"] + df_patients_all["LogNumMeds"], 
+            q=4, 
+            labels=["L", "M", "H", "VH"], 
+            duplicates="drop"
+        )
+    except ValueError:
+        df_patients_all["UtilGroup"] = pd.cut(
+            df_patients_all["LogNumCodes"] + df_patients_all["LogNumMeds"], 
+            bins=min(4, max(1, df_patients_all["LogNumCodes"].nunique())), 
+            labels=False, 
+            include_lowest=True
+        ).astype(str)
+
+    try:
+        df_patients_all["AgeGroup"] = pd.qcut(
+            df_patients_all["AgeIn2026"].fillna(50), 
+            q=5, 
+            labels=False, 
+            duplicates="drop"
+        )
+    except ValueError:
+        df_patients_all["AgeGroup"] = pd.cut(
+            df_patients_all["AgeIn2026"].fillna(50), 
+            bins=min(5, max(1, df_patients_all["AgeIn2026"].nunique())), 
+            labels=False, 
+            include_lowest=True
+        )
+
     df_patients_all["StratifyKey"] = df_patients_all["Gender"].astype(str) + "_" + df_patients_all["AgeGroup"].astype(str) + "_" + df_patients_all["UtilGroup"].astype(str)
 
-    def safe_sample(g, frac):
-        n = max(1, min(len(g), int(len(g) * frac)))
-        return g.sample(n=n, random_state=42)
+    # SAFE SAMPLING HELPER
+    def safe_sample(g, target_fraction):
+        n_requested = max(1, int(len(g) * target_fraction))
+        n_safe = min(len(g), n_requested)
+        return g.sample(n=n_safe, random_state=42)
 
-    # Fixed pandas FutureWarning by passing include_groups=False
     if TEST_MODE:
         target_frac = TARGET_PATIENTS / len(df_patients_all)
         sampled_df = df_patients_all.groupby("StratifyKey", group_keys=False).apply(
-            lambda g: safe_sample(g, target_frac), 
-            include_groups=False
+            lambda g: safe_sample(g, target_frac)
         )
         if len(sampled_df) > TARGET_PATIENTS:
             sampled_df = sampled_df.sample(n=TARGET_PATIENTS, random_state=42)
     else:
         sampled_df = df_patients_all.groupby("StratifyKey", group_keys=False).apply(
-            lambda g: safe_sample(g, TRAIN_SAMPLE_FRACTION), 
-            include_groups=False
+            lambda g: safe_sample(g, TRAIN_SAMPLE_FRACTION)
         )
 
-    sampled_patient_ids = set(sampled_df["IDPatient"].astype(str))
-    df_patients_train = df_patients_all[df_patients_all["IDPatient"].astype(str).isin(sampled_patient_ids)].drop(
-        columns=["UtilGroup", "AgeGroup", "StratifyKey"], errors="ignore"
-    ).copy()
+    sampled_patient_ids = set(sampled_df["IDPatient"])
+    df_patients_train = df_patients_all[df_patients_all["IDPatient"].isin(sampled_patient_ids)].drop(columns=["UtilGroup", "AgeGroup", "StratifyKey"]).copy()
 
-    # Ensure String IDs across all tables to prevent type mismatch during validation
-    df_patients_train["IDPatient"] = df_patients_train["IDPatient"].astype(str)
     train_data = {"patients": df_patients_train.replace(r"^\s*$", np.nan, regex=True)}
 
-    # Collect and filter child tables
     for table_key in ["codes", "medications", "immunisations"]:
         f_path = os.path.join(PREPROCESSED_DIR, files[table_key])
         if not os.path.exists(f_path):
@@ -271,57 +372,43 @@ def run_step2_and_3_training():
             continue
 
         chunks = []
-        chunk_iter = pd.read_csv(f_path, sep=DELIMITER, chunksize=1500000, encoding=READ_ENCODING, dtype=COL_TYPES[table_key], on_bad_lines="skip")
+        chunk_iter = pd.read_csv(f_path, sep=DELIMITER, chunksize=1000000, encoding=READ_ENCODING, dtype=str, on_bad_lines="skip")
         for chunk in chunk_iter:
             chunk.columns = chunk.columns.str.strip()
-            chunk["IDPatient"] = chunk["IDPatient"].astype(str)
-            filtered = chunk[chunk["IDPatient"].isin(sampled_patient_ids)]
-            if not filtered.empty:
-                chunks.append(filtered)
+            filtered_chunk = chunk[chunk["IDPatient"].isin(sampled_patient_ids)]
+            if not filtered_chunk.empty:
+                chunks.append(filtered_chunk)
 
         if chunks:
-            df_child = pd.concat(chunks, ignore_index=True)
-            if table_key == "medications" and "AgeAtMedicationEnd" in df_child.columns and "AgeAtMedicationStart" in df_child.columns:
-                df_child["AgeAtMedicationEnd"] = df_child["AgeAtMedicationEnd"].fillna(df_child["AgeAtMedicationStart"])
-            df_child["IDPatient"] = df_child["IDPatient"].astype(str)
-            train_data[table_key] = df_child.replace(r"^\s*$", np.nan, regex=True)
+            df_child_train = pd.concat(chunks, ignore_index=True)
+            if table_key == "medications" and "AgeAtMedicationEnd" in df_child_train.columns and "AgeAtMedicationStart" in df_child_train.columns:
+                df_child_train["AgeAtMedicationEnd"] = df_child_train["AgeAtMedicationEnd"].fillna(df_child_train["AgeAtMedicationStart"])
+            train_data[table_key] = df_child_train.replace(r"^\s*$", np.nan, regex=True)
         else:
             train_data[table_key] = pd.DataFrame(columns=list(COL_TYPES[table_key].keys()))
 
-    # Build Metadata explicitly to prevent auto-detecting invalid foreign keys
+    # Build Metadata & Train Model
     global_metadata = MultiTableMetadata()
-    
-    # Detect table columns without auto-inferring cross-table relationships
-    for table_name, df_table in train_data.items():
-        if len(df_table) > 0:
-            global_metadata.detect_table_from_dataframe(table_name=table_name, data=df_table)
-        else:
-            global_metadata.add_table(table_name=table_name)
+    global_metadata.detect_from_dataframes(data=train_data)
 
-    # Configure ID and Primary Key for parent
     if "patients" in global_metadata.tables:
         global_metadata.update_column(table_name="patients", column_name="IDPatient", sdtype="id")
         global_metadata.set_primary_key(table_name="patients", column_name="IDPatient")
 
-    # Set explicit 1-to-N relationships solely on IDPatient
     for child_table in ["codes", "medications", "immunisations"]:
         if child_table in global_metadata.tables and "IDPatient" in global_metadata.tables[child_table].columns:
             global_metadata.update_column(table_name=child_table, column_name="IDPatient", sdtype="id")
-            
-            # Explicitly mark IDEvent as an ID if present
-            if "IDEvent" in global_metadata.tables[child_table].columns:
-                global_metadata.update_column(table_name=child_table, column_name="IDEvent", sdtype="id")
-                
-            global_metadata.add_relationship(
-                parent_table_name="patients",
-                child_table_name=child_table,
-                parent_primary_key="IDPatient",
-                child_foreign_key="IDPatient"
-            )
+            try:
+                global_metadata.add_relationship(parent_table_name="patients", child_table_name=child_table, parent_primary_key="IDPatient", child_foreign_key="IDPatient")
+            except Exception:
+                pass
 
-    # Ensure no lingering foreign key mappings on numerical columns
     global_metadata.validate()
-    global_metadata.save_to_json(filepath=os.path.join(MODEL_DIR, "global_metadata.json"))
+    metadata_json_path = os.path.join(MODEL_DIR, "global_metadata.json")
+    if os.path.exists(metadata_json_path):
+        os.remove(metadata_json_path)
+
+    global_metadata.save_to_json(filepath=metadata_json_path)
 
     model_path = os.path.join(MODEL_DIR, "global_murmur_synthesizer.pkl")
     if os.path.exists(model_path):
@@ -331,20 +418,20 @@ def run_step2_and_3_training():
         print(" -> Fitting Unified HMASynthesizer model...")
         synthesizer = HMASynthesizer(global_metadata)
         
-        # Add Inequality constraint if using newer SDV constraints module or skip if using basic HMA
         if "medications" in train_data and len(train_data["medications"]) > 0:
             try:
-                from sdv.constraints import Inequality
-                med_constraint = Inequality(
-                    table_name="medications",
-                    low_column_name="AgeAtMedicationStart",
-                    high_column_name="AgeAtMedicationEnd"
-                )
+                med_constraint = {
+                    "constraint_class": "Inequality",
+                    "table_name": "medications",
+                    "constraint_parameters": {
+                        "low_column_name": "AgeAtMedicationStart",
+                        "high_column_name": "AgeAtMedicationEnd",
+                    },
+                }
                 synthesizer.add_constraints(constraints=[med_constraint])
             except Exception as e:
-                # If constraints module is structured differently in your SDV version, proceed with standard fit
-                pass
-
+                print(f" -> Constraint note: {e}")
+                
         synthesizer.fit(train_data)
         synthesizer.save(filepath=model_path)
 
@@ -352,12 +439,12 @@ def run_step2_and_3_training():
 
 
 # =====================================================================
-# STEP 4 & 5: CHUNKED GENERATION & CLINICAL POST-FILTERING
+# STEP 4 & 5: CHUNKED GENERATION & CLINICAL POST-PROCESSING
 # =====================================================================
 def run_step4_and_5_generation(synthesizer):
-    print("\n--- STEP 4 & 5: Scaled Chunk Generation & Clinical Rule Enforcement ---")
+    print("\n--- STEP 4 & 5: Chunked Generation & Clinical Rule Filtering ---")
     
-    # Generate temporary chunks
+    # 4. Generate Chunks
     for chunk_idx in range(NUM_GEN_CHUNKS):
         chunk_check = os.path.join(TEMP_CHUNK_DIR, f"patients_chunk_{chunk_idx}.csv")
         if os.path.exists(chunk_check):
@@ -370,15 +457,24 @@ def run_step4_and_5_generation(synthesizer):
             if len(df) > 0:
                 if "IDPatient" in df.columns:
                     df["IDPatient"] = prefix + df["IDPatient"].astype(str)
-                df.to_csv(os.path.join(TEMP_CHUNK_DIR, f"{table_name}_chunk_{chunk_idx}.csv"), sep=DELIMITER, index=False, encoding="utf-8")
+                chunk_file = os.path.join(TEMP_CHUNK_DIR, f"{table_name}_chunk_{chunk_idx}.csv")
+                df.to_csv(chunk_file, sep=DELIMITER, index=False, encoding="utf-8")
 
         del sampled_data
         gc.collect()
 
+    # 5. Clinical Post-Processing & Remapping
     with open(os.path.join(MODEL_DIR, "real_vocab_frequencies.json"), "r") as f:
         real_code_vocab_freq = json.load(f)
 
-    # Build cross-table context dictionary
+    sex_rules_path = os.path.join(MODEL_DIR, "sex_exclusive_codes.json")
+    fem_exc, male_exc = set(), set()
+    if os.path.exists(sex_rules_path):
+        with open(sex_rules_path, "r") as f:
+            sex_rules = json.load(f)
+            fem_exc = set(sex_rules.get("female_exclusive", []))
+            male_exc = set(sex_rules.get("male_exclusive", []))
+
     patient_context = {}
     unique_patient_ids = set()
 
@@ -396,17 +492,12 @@ def run_step4_and_5_generation(synthesizer):
                 }
 
     patient_map = {old_id: f"SYN_PAT_{i+1:08d}" for i, old_id in enumerate(sorted(unique_patient_ids))}
-    
-    global_counters = {
-        "codes": 1,
-        "medications": 1,
-    }
+    global_med_event_counter = 1
 
     for table_name, orig_filename in files.items():
         final_output_path = os.path.join(OUTPUT_DIR, f"synthetic_{orig_filename}")
         real_counts = real_code_vocab_freq.get(table_name, {})
         code_col = "SNOMEDCode" if table_name == "codes" else ("IDMultiLexProduct" if table_name == "medications" else "ImmsSNOMEDCode")
-        desc_col = "NameOfMedication" if table_name == "medications" else ("SNOMEDCode" if table_name == "codes" else "ImmsReadCode")
 
         first_chunk = True
         for chunk_idx in range(NUM_GEN_CHUNKS):
@@ -417,7 +508,7 @@ def run_step4_and_5_generation(synthesizer):
             chunk_df = pd.read_csv(chunk_file, sep=DELIMITER, dtype=str)
 
             if table_name == "patients":
-                chunk_df = chunk_df.drop(columns=["LogNumCodes", "LogNumMeds", "LogNumImms"], errors="ignore")
+                chunk_df = chunk_df.drop(columns=["LogNumCodes", "LogNumMeds", "LogNumImms", "DiseaseMedRatio"], errors="ignore")
 
             if "IDPatient" in chunk_df.columns:
                 chunk_df["_Gender"] = chunk_df["IDPatient"].map(lambda x: patient_context.get(x, {}).get("Gender", "U"))
@@ -425,48 +516,62 @@ def run_step4_and_5_generation(synthesizer):
                 chunk_df["IDPatient"] = chunk_df["IDPatient"].map(patient_map)
                 chunk_df = chunk_df.dropna(subset=["IDPatient"])
 
+            # Clinical Filtering Logic
             if table_name in ["codes", "medications", "immunisations"]:
-                # Sex-specific keyword filtering
-                if desc_col in chunk_df.columns:
+                
+                # Enforce data-driven sex-exclusive SNOMED code filters for the codes table
+                if table_name == "codes" and "SNOMEDCode" in chunk_df.columns:
+                    male_violation = (chunk_df["_Gender"] == "M") & (chunk_df["SNOMEDCode"].isin(fem_exc))
+                    fem_violation = (chunk_df["_Gender"] == "F") & (chunk_df["SNOMEDCode"].isin(male_exc))
+                    chunk_df = chunk_df[~(male_violation | fem_violation)]
+
+                # Apply text-based biological regex ONLY to medications text descriptions
+                if table_name == "medications" and "NameOfMedication" in chunk_df.columns:
                     male_mask = chunk_df["_Gender"] == "M"
                     fem_mask = chunk_df["_Gender"] == "F"
-                    female_match = chunk_df[desc_col].str.contains(FEMALE_REGEX, na=False)
-                    male_match = chunk_df[desc_col].str.contains(MALE_REGEX, na=False)
+                    female_code_match = chunk_df["NameOfMedication"].str.contains(FEMALE_REGEX, na=False)
+                    male_code_match = chunk_df["NameOfMedication"].str.contains(MALE_REGEX, na=False)
 
-                    chunk_df = chunk_df[~(male_mask & female_match)]
-                    chunk_df = chunk_df[~(fem_mask & male_match)]
+                    chunk_df = chunk_df[~(male_mask & female_code_match)]
+                    chunk_df = chunk_df[~(fem_mask & male_code_match)]
 
-                # Post-mortem event removal
+                # Post-Mortem Event Filter
                 age_col = "AgeAtEvent" if "AgeAtEvent" in chunk_df.columns else "AgeAtMedicationStart"
                 if age_col in chunk_df.columns:
                     event_age = pd.to_numeric(chunk_df[age_col], errors="coerce")
-                    post_mortem = chunk_df["_AgeAtDeath"].notna() & event_age.notna() & (event_age > chunk_df["_AgeAtDeath"])
-                    chunk_df = chunk_df[~post_mortem]
+                    post_mortem_mask = chunk_df["_AgeAtDeath"].notna() & event_age.notna() & (event_age > chunk_df["_AgeAtDeath"])
+                    chunk_df = chunk_df[~post_mortem_mask]
 
-                # Noise threshold filter
+                # Copula Noise Filter (< 5 occurrences in real baseline)
                 if code_col in chunk_df.columns:
-                    rare_codes = {k for k, v in real_counts.items() if v < 20}
-                    chunk_df = chunk_df[~chunk_df[code_col].isin(rare_codes)]
+                    rare_real_codes = {k for k, v in real_counts.items() if v < 5}
+                    chunk_df = chunk_df[~chunk_df[code_col].isin(rare_real_codes)]
 
                 chunk_df = chunk_df.drop(columns=["_Gender", "_AgeAtDeath"], errors="ignore")
 
-            # Sequential Event ID generation for event tables
-            if table_name in ["codes", "medications"]:
+            if table_name == "medications":
                 num_rows = len(chunk_df)
-                start_c = global_counters[table_name]
-                prefix_code = "EVT_C" if table_name == "codes" else "EVT_M"
-                chunk_df["IDEvent"] = [f"SYN_{prefix_code}_{i:09d}" for i in range(start_c, start_c + num_rows)]
-                global_counters[table_name] += num_rows
+                global_med_event_counter += num_rows
+
+            # Enforce strict Privacy-Safe final output columns matching LLR-DfR schemas
+            if table_name == "patients":
+                chunk_df = chunk_df[["IDPatient", "Gender", "AgeIn2026", "AgeAtDeath"]]
+            elif table_name == "codes":
+                chunk_df = chunk_df[["CTV3Code", "SNOMEDCode", "EpisodeType", "IDEvent", "IDPatient", "AgeAtEvent"]]
+            elif table_name == "medications":
+                chunk_df = chunk_df[["IDMultiLexProduct", "NameOfMedication", "MedicationDosage", "IDPatient", "AgeAtMedicationStart", "AgeAtMedicationEnd"]]
+            elif table_name == "immunisations":
+                chunk_df = chunk_df[["Dose", "Location", "ImmsReadCode", "ImmsSNOMEDCode", "IDPatient", "AgeAtEvent"]]
 
             chunk_df.to_csv(final_output_path, sep=DELIMITER, mode="w" if first_chunk else "a", header=first_chunk, index=False, encoding="utf-8")
             first_chunk = False
 
     shutil.rmtree(TEMP_CHUNK_DIR, ignore_errors=True)
-    print(f"\nSUCCESS: Pipeline complete. Generated outputs written to: {OUTPUT_DIR}")
+    print(f"\nSUCCESS: Pipeline execution complete. Output saved to: {OUTPUT_DIR}")
 
 
 # =====================================================================
-# MAIN ENTRY POINT
+# MAIN PIPELINE ENTRY POINT
 # =====================================================================
 if __name__ == "__main__":
     run_step1_preprocessing()
