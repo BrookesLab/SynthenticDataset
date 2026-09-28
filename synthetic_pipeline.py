@@ -20,7 +20,7 @@ TEST_MODE = False  # Set to False for the full 500k production run
 BASE_PATH = "Subsamples"
 PREPROCESSED_DIR = "hma/Preprocessed_Data"
 CURRENT_YEAR = 2026
-DELIMITER = ","  # 👈 CSV Comma Separator
+DELIMITER = ","  # CSV Comma Separator
 READ_ENCODING = "latin-1"
 CHUNKSIZE = 1_000_000
 
@@ -39,7 +39,7 @@ else:
     TEMP_CHUNK_DIR = "hma_prod/Temp_Chunks"
     TRAIN_SAMPLE_FRACTION = 0.03  # 3% stratified sample (~15k patients)
     NUM_GEN_CHUNKS = 8
-    SAMPLE_SCALE_PER_CHUNK = 4.1667  # 👈 Scale factor to hit 500k total
+    SAMPLE_SCALE_PER_CHUNK = 4.1667  # Scale factor to hit 500k total
 
 os.makedirs(PREPROCESSED_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -65,6 +65,7 @@ COL_TYPES = {
     "codes": {
         "CTV3Code": "str",
         "SNOMEDCode": "str",
+        "SNOMEDText": "str",  # 👈 Added SNOMEDText mapping
         "EpisodeType": "str",
         "IDEvent": "str",
         "IDPatient": "str",
@@ -223,10 +224,13 @@ def run_step1_preprocessing():
             
             chunk.drop(columns=date_cols, inplace=True, errors="ignore")
             
-            # Structural sanity cleans & exact LLR-DfR schema mappings
-            if key == "codes" and "SNOMEDCode" in chunk.columns:
-                chunk["SNOMEDCode"] = chunk["SNOMEDCode"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
-                chunk = chunk[~chunk["SNOMEDCode"].isin(["", "nan", "None", "-1", "<NA>"])]
+            # Structural sanity cleans & SNOMEDText mapping
+            if key == "codes":
+                if "SNOMEDCode" in chunk.columns:
+                    chunk["SNOMEDCode"] = chunk["SNOMEDCode"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+                    chunk = chunk[~chunk["SNOMEDCode"].isin(["", "nan", "None", "-1", "<NA>"])]
+                if "SNOMEDText" in chunk.columns:
+                    chunk["SNOMEDText"] = chunk["SNOMEDText"].astype(str).str.strip()
             elif key == "medications" and "IDMultiLexProduct" in chunk.columns:
                 chunk["IDMultiLexProduct"] = chunk["IDMultiLexProduct"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
                 chunk = chunk[~chunk["IDMultiLexProduct"].isin(["", "nan", "None", "-1", "<NA>"])]
@@ -492,7 +496,7 @@ def run_step4_and_5_generation(synthesizer):
                 }
 
     patient_map = {old_id: f"SYN_PAT_{i+1:08d}" for i, old_id in enumerate(sorted(unique_patient_ids))}
-    global_med_event_counter = 1
+    global_med_event_counter = 1  # 👈 Restored counter variable
 
     for table_name, orig_filename in files.items():
         final_output_path = os.path.join(OUTPUT_DIR, f"synthetic_{orig_filename}")
@@ -553,11 +557,11 @@ def run_step4_and_5_generation(synthesizer):
                 num_rows = len(chunk_df)
                 global_med_event_counter += num_rows
 
-            # Enforce strict Privacy-Safe final output columns matching LLR-DfR schemas
+            # Enforce strict Privacy-Safe final output columns matching LLR-DfR schemas including SNOMEDText
             if table_name == "patients":
                 chunk_df = chunk_df[["IDPatient", "Gender", "AgeIn2026", "AgeAtDeath"]]
             elif table_name == "codes":
-                chunk_df = chunk_df[["CTV3Code", "SNOMEDCode", "EpisodeType", "IDEvent", "IDPatient", "AgeAtEvent"]]
+                chunk_df = chunk_df[["CTV3Code", "SNOMEDCode", "SNOMEDText", "EpisodeType", "IDEvent", "IDPatient", "AgeAtEvent"]]
             elif table_name == "medications":
                 chunk_df = chunk_df[["IDMultiLexProduct", "NameOfMedication", "MedicationDosage", "IDPatient", "AgeAtMedicationStart", "AgeAtMedicationEnd"]]
             elif table_name == "immunisations":
